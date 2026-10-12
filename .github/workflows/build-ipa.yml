@@ -1,0 +1,285 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Dashboard build ID"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build-${{ inputs.build_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Validate build input
+        shell: bash
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_ID" =~ ^[A-Za-z0-9_-]+$ ]] || {
+            echo "::error::Invalid build ID"
+            exit 1
+          }
+
+      # This request/response contract must match the dashboard backend.
+      - name: Request authorized build configuration
+        id: bootstrap
+        shell: bash
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+          DASHBOARD_API_TOKEN: ${{ secrets.DASHBOARD_API_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          test -n "$DASHBOARD_URL" || {
+            echo "::error::DASHBOARD_URL is missing"
+            exit 1
+          }
+
+          test -n "$DASHBOARD_API_TOKEN" || {
+            echo "::error::DASHBOARD_API_TOKEN is missing"
+            exit 1
+          }
+
+          mkdir -p "$RUNNER_TEMP/ios-build"
+          CONFIG="$RUNNER_TEMP/ios-build/bootstrap.json"
+
+          HTTP_CODE=$(curl --silent --show-error \
+            --output "$CONFIG" \
+            --write-out '%{http_code}' \
+            --fail \
+            --request POST \
+            "${DASHBOARD_URL%/}/api/internal/builds/${BUILD_ID}/bootstrap" \
+            --header "Authorization: Bearer ${DASHBOARD_API_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "{\"run_id\":${RUN_ID},\"run_attempt\":${RUN_ATTEMPT}}") || {
+              echo "::error::Bootstrap request failed"
+              exit 1
+            }
+
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "::error::Bootstrap rejected the build (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          # Expected example contract; adapt to the real backend response.
+          jq -e '
+            .source_repo |
+            strings |
+            test("^[^/]+/[^/]+$")
+          ' "$CONFIG" >/dev/null
+
+          jq -e '
+            (.source_branch | strings | length > 0) and
+            (.source_token | strings | length > 0) and
+            (.bundle_id | strings | length > 0) and
+            (.team_id | strings | length > 0) and
+            (.certificate_p12_base64 | strings | length > 0) and
+            (.certificate_password | strings | length > 0) and
+            (.provisioning_profile_base64 | strings | length > 0)
+          ' "$CONFIG" >/dev/null || {
+            echo "::error::Required signing configuration is missing"
+            exit 1
+          }
+
+          # Never print the configuration: it contains secrets.
+          echo "Build configuration received and validated."
+
+      - name: Checkout Flutter source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ fromJSON('{}').unused }}
+          path: source
+        continue-on-error: true
+
+      # Replace the placeholder checkout step above with the actual
+      # source repository checkout after adapting the response contract.
+      - name: Checkout configured source repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPOSITORY_TOKEN }}
+        run: |
+          set -euo pipefail
+          CONFIG="$RUNNER_TEMP/ios-build/bootstrap.json"
+
+          REPO=$(jq -er '.source_repo' "$CONFIG")
+          BRANCH=$(jq -er '.source_branch' "$CONFIG")
+
+          # Prefer the temporary source token returned by the authorized
+          # bootstrap response, not a shared permanent token.
+          SOURCE_TOKEN=$(jq -er '.source_token' "$CONFIG")
+          echo "::add-mask::$SOURCE_TOKEN"
+
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SOURCE_TOKEN" | base64 | tr -d '\n')" \
+            clone --depth 1 --branch "$BRANCH" \
+            "https://github.com/${REPO}.git" source
+
+          unset SOURCE_TOKEN
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install signing assets
+        id: signing
+        shell: bash
+        env:
+          CONFIG_PATH: ${{ runner.temp }}/ios-build/bootstrap.json
+        run: |
+          set -euo pipefail
+          umask 077
+
+          CONFIG="$CONFIG_PATH"
+          KEYCHAIN="$RUNNER_TEMP/build-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+
+          jq -er '.certificate_p12_base64' "$CONFIG" |
+            base64 --decode > "$RUNNER_TEMP/distribution.p12"
+
+          jq -er '.provisioning_profile_base64' "$CONFIG" |
+            base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+
+          CERT_PASSWORD=$(jq -er '.certificate_password' "$CONFIG")
+          echo "::add-mask::$CERT_PASSWORD"
+
+          security create-keychain \
+            -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          security set-keychain-settings \
+            -lut 21600 "$KEYCHAIN"
+
+          security unlock-keychain \
+            -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          security import "$RUNNER_TEMP/distribution.p12" \
+            -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          security list-keychains -d user -s "$KEYCHAIN"
+          security default-keychain -d user -s "$KEYCHAIN"
+
+          PROFILE_PLIST="$RUNNER_TEMP/profile.plist"
+          security cms -D \
+            -i "$RUNNER_TEMP/profile.mobileprovision" \
+            > "$PROFILE_PLIST"
+
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy \
+            -c 'Print UUID' "$PROFILE_PLIST")
+
+          PROFILE_BUNDLE_ID=$(/usr/libexec/PlistBuddy \
+            -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")
+
+          PROFILE_TEAM=$(/usr/libexec/PlistBuddy \
+            -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")
+
+          BUNDLE_ID=$(jq -er '.bundle_id' "$CONFIG")
+          TEAM_ID=$(jq -er '.team_id' "$CONFIG")
+
+          [[ "$PROFILE_BUNDLE_ID" == "$TEAM_ID.$BUNDLE_ID" ]] || {
+            echo "::error::Provisioning profile Bundle ID mismatch"
+            exit 1
+          }
+
+          [[ "$PROFILE_TEAM" == "$TEAM_ID" ]] || {
+            echo "::error::Provisioning profile Team ID mismatch"
+            exit 1
+          }
+
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILE_DIR"
+          cp "$RUNNER_TEMP/profile.mobileprovision" \
+            "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
+
+          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+          echo "team_id=$TEAM_ID" >> "$GITHUB_OUTPUT"
+          echo "profile_uuid=$PROFILE_UUID" >> "$GITHUB_OUTPUT"
+
+          unset CERT_PASSWORD KEYCHAIN_PASSWORD
+
+      - name: Install dependencies
+        working-directory: source
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Build IPA
+        working-directory: source
+        shell: bash
+        env:
+          BUNDLE_ID: ${{ steps.signing.outputs.bundle_id }}
+          TEAM_ID: ${{ steps.signing.outputs.team_id }}
+          PROFILE_UUID: ${{ steps.signing.outputs.profile_uuid }}
+        run: |
+          set -euo pipefail
+
+          # The Xcode project must support manual signing with these values.
+          # Some projects need their own export options or signing settings.
+          cat > "$RUNNER_TEMP/ios-build/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key>
+              <string>${PROFILE_UUID}</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+          flutter build ipa --release \
+            --export-options-plist="$RUNNER_TEMP/ios-build/ExportOptions.plist"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-${{ inputs.build_id }}
+          path: source/build/ios/ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Cleanup signing assets
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          security delete-keychain \
+            "$RUNNER_TEMP/build-signing.keychain-db"
+
+          rm -f "$RUNNER_TEMP/distribution.p12"
+          rm -f "$RUNNER_TEMP/profile.mobileprovision"
+          rm -f "$RUNNER_TEMP/profile.plist"
+          rm -rf "$RUNNER_TEMP/ios-build"
