@@ -1,344 +1,186 @@
 name: Build iOS IPA
 
+run-name: Build ${{ inputs.build_id }} [${{ inputs.correlation_id }}]
+
 on:
   workflow_dispatch:
     inputs:
       build_id:
-        description: Dashboard build ID
+        description: Build identifier persisted by the dashboard
         required: true
         type: string
-
-permissions:
-  contents: read
+      correlation_id:
+        description: Correlation id used to verify the run
+        required: true
+        type: string
 
 concurrency:
   group: ios-build-${{ inputs.build_id }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+
 jobs:
-  build:
+  build-ios:
     name: Build and optionally upload to TestFlight
     runs-on: macos-15
     timeout-minutes: 90
 
     steps:
-      - name: Validate input
-        shell: bash
-        env:
-          BUILD_ID: ${{ inputs.build_id }}
-        run: |
-          set -euo pipefail
-          [[ "$BUILD_ID" =~ ^[A-Za-z0-9_-]+$ ]] || {
-            echo "::error::Invalid build ID"
-            exit 1
-          }
-
-      - name: Request build configuration
-        id: bootstrap
-        shell: bash
-        env:
-          BUILD_ID: ${{ inputs.build_id }}
-          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
-          DASHBOARD_API_TOKEN: ${{ secrets.DASHBOARD_API_TOKEN }}
+      - name: Bootstrap the build environment from the dashboard
         run: |
           set -euo pipefail
           umask 077
 
-          : "${DASHBOARD_URL:?Missing DASHBOARD_URL}"
-          : "${DASHBOARD_API_TOKEN:?Missing DASHBOARD_API_TOKEN}"
+          : "${DASHBOARD_URL:?Missing DASHBOARD_URL secret}"
 
           WORK="$RUNNER_TEMP/ios-build"
           mkdir -p "$WORK"
-          CONFIG="$WORK/bootstrap.json"
+          BOOTSTRAP="$WORK/bootstrap.json"
 
-          HTTP_CODE=$(curl -sS \
-            -o "$CONFIG" \
-            -w '%{http_code}' \
+          curl -fsS \
             -X POST \
-            "${DASHBOARD_URL%/}/api/internal/builds/${BUILD_ID}/bootstrap" \
-            -H "Authorization: Bearer ${DASHBOARD_API_TOKEN}" \
+            "${DASHBOARD_URL%/}/api/internal/builds/${{ inputs.build_id }}/bootstrap" \
+            -H "Authorization: Bearer ${{ secrets.BUILD_RUNNER_TOKEN }}" \
             -H "Content-Type: application/json" \
-            --data "{\"run_id\":${GITHUB_RUN_ID},\"run_attempt\":${GITHUB_RUN_ATTEMPT}}") || {
-              echo "::error::Bootstrap request failed"
-              exit 1
-            }
+            --data "{\"runId\":\"${{ github.run_id }}\",\"repository\":\"${{ github.repository }}\",\"runAttempt\":${{ github.run_attempt }}}" \
+            -o "$BOOTSTRAP"
+          chmod 600 "$BOOTSTRAP"
 
-          if [[ "$HTTP_CODE" != "200" ]]; then
-            echo "::error::Backend rejected bootstrap (HTTP $HTTP_CODE)"
-            exit 1
+          SOURCE_REPO="$(jq -r '.source.repository' "$BOOTSTRAP")"
+          SOURCE_BRANCH="$(jq -r '.source.branch' "$BOOTSTRAP")"
+          SOURCE_TOKEN="$(jq -r '.source.token' "$BOOTSTRAP")"
+          BUNDLE_ID="$(jq -r '.signing.bundleId' "$BOOTSTRAP")"
+          TEAM_ID="$(jq -r '.signing.teamId' "$BOOTSTRAP")"
+          FLAVOR="$(jq -r '.signing.buildFlavor // empty' "$BOOTSTRAP")"
+          TESTFLIGHT="$(jq -r '.signing.testflightEnabled' "$BOOTSTRAP")"
+          CERT_PASSWORD="$(jq -r '.signing.certificatePassword' "$BOOTSTRAP")"
+
+          echo "SOURCE_REPO=$SOURCE_REPO" >> "$GITHUB_ENV"
+          echo "SOURCE_BRANCH=$SOURCE_BRANCH" >> "$GITHUB_ENV"
+          echo "SOURCE_TOKEN=$SOURCE_TOKEN" >> "$GITHUB_ENV"
+          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+          echo "TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+          echo "BUILD_FLAVOR=$FLAVOR" >> "$GITHUB_ENV"
+          echo "TESTFLIGHT_ENABLED=$TESTFLIGHT" >> "$GITHUB_ENV"
+          echo "CERT_PASSWORD=$CERT_PASSWORD" >> "$GITHUB_ENV"
+
+          jq -r '.signing.certificateP12Base64' "$BOOTSTRAP" \
+            | base64 --decode \
+            > "$WORK/cert.p12"
+          jq -r '.signing.provisioningProfileBase64' "$BOOTSTRAP" \
+            | base64 --decode \
+            > "$WORK/profile.mobileprovision"
+          chmod 600 "$WORK/cert.p12" "$WORK/profile.mobileprovision"
+
+          if jq -e '.signing.appStoreConnect != null' "$BOOTSTRAP" > /dev/null; then
+            APP_STORE_KEY="$(jq -r '.signing.appStoreConnect.keyId' "$BOOTSTRAP")"
+            APP_STORE_ISSUER="$(jq -r '.signing.appStoreConnect.issuerId' "$BOOTSTRAP")"
+            jq -r '.signing.appStoreConnect.privateKey' "$BOOTSTRAP" \
+              > "$WORK/AuthKey_$APP_STORE_KEY.p8"
+            chmod 600 "$WORK/AuthKey_$APP_STORE_KEY.p8"
+            echo "ASC_KEY_ID=$APP_STORE_KEY" >> "$GITHUB_ENV"
+            echo "ASC_ISSUER_ID=$APP_STORE_ISSUER" >> "$GITHUB_ENV"
+            echo "ASC_KEY_PATH=$WORK/AuthKey_$APP_STORE_KEY.p8" >> "$GITHUB_ENV"
           fi
 
-          # Expected bootstrap contract. Adapt these names to the real API.
-          jq -e '
-            (.build_mode == "build" or .build_mode == "build_upload") and
-            (.source_repo | strings | test("^[^/]+/[^/]+$")) and
-            (.source_branch | strings | length > 0) and
-            (.source_token | strings | length > 0) and
-            (.bundle_id | strings | length > 0) and
-            (.team_id | strings | length > 0) and
-            (.certificate_p12_base64 | strings | length > 0) and
-            (.certificate_password | strings | length > 0) and
-            (.provisioning_profile_base64 | strings | length > 0)
-          ' "$CONFIG" >/dev/null || {
-            echo "::error::Invalid or incomplete bootstrap response"
-            exit 1
-          }
+          rm -f "$BOOTSTRAP"
 
-          MODE=$(jq -r '.build_mode' "$CONFIG")
-          echo "build_mode=$MODE" >> "$GITHUB_OUTPUT"
-
-          echo "Authorized build configuration received."
-
-      - name: Checkout Flutter source
-        shell: bash
-        env:
-          CONFIG_PATH: ${{ runner.temp }}/ios-build/bootstrap.json
-        run: |
-          set -euo pipefail
-
-          REPO=$(jq -er '.source_repo' "$CONFIG_PATH")
-          BRANCH=$(jq -er '.source_branch' "$CONFIG_PATH")
-          TOKEN=$(jq -er '.source_token' "$CONFIG_PATH")
-
-          echo "::add-mask::$TOKEN"
-
-          # Use the temporary repository token supplied for this build.
-          AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
-          git -c http.extraheader="AUTHORIZATION: basic $AUTH" \
-            clone --depth 1 --branch "$BRANCH" \
-            "https://github.com/${REPO}.git" source
-
-          unset TOKEN AUTH
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
+      - name: Check out source repository
+        uses: actions/checkout@v4
         with:
-          channel: stable
-          cache: false
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ env.SOURCE_TOKEN }}
+          persist-credentials: false
 
-      - name: Install Apple signing assets
-        id: signing
-        shell: bash
-        env:
-          CONFIG_PATH: ${{ runner.temp }}/ios-build/bootstrap.json
+      - name: Install provisioning profile
         run: |
           set -euo pipefail
-          umask 077
-
-          CONFIG="$CONFIG_PATH"
-          WORK="$RUNNER_TEMP/ios-build"
-
-          KEYCHAIN="$WORK/build-signing.keychain-db"
-          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
-
-          jq -er '.certificate_p12_base64' "$CONFIG" |
-            base64 --decode > "$WORK/distribution.p12"
-
-          jq -er '.provisioning_profile_base64' "$CONFIG" |
-            base64 --decode > "$WORK/profile.mobileprovision"
-
-          CERT_PASSWORD=$(jq -er '.certificate_password' "$CONFIG")
-          echo "::add-mask::$CERT_PASSWORD"
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-
-          security import "$WORK/distribution.p12" \
-            -k "$KEYCHAIN" \
-            -P "$CERT_PASSWORD" \
-            -T /usr/bin/codesign
-
-          security set-key-partition-list \
-            -S apple-tool:,apple: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-
-          security list-keychains -d user -s "$KEYCHAIN"
-          security default-keychain -d user -s "$KEYCHAIN"
-
-          security cms -D \
-            -i "$WORK/profile.mobileprovision" \
-            > "$WORK/profile.plist"
-
-          UUID=$(/usr/libexec/PlistBuddy \
-            -c 'Print UUID' "$WORK/profile.plist")
-
-          PROFILE_APP_ID=$(/usr/libexec/PlistBuddy \
-            -c 'Print :Entitlements:application-identifier' "$WORK/profile.plist")
-
-          PROFILE_TEAM=$(/usr/libexec/PlistBuddy \
-            -c 'Print :TeamIdentifier:0' "$WORK/profile.plist")
-
-          BUNDLE_ID=$(jq -er '.bundle_id' "$CONFIG")
-          TEAM_ID=$(jq -er '.team_id' "$CONFIG")
-
-          [[ "$PROFILE_TEAM" == "$TEAM_ID" ]] || {
-            echo "::error::Provisioning profile Team ID mismatch"
-            exit 1
-          }
-
-          # Support exact or wildcard application identifiers.
-          case "$BUNDLE_ID" in
-            ${PROFILE_APP_ID#"$TEAM_ID."})
-              ;;
-            *)
-              PROFILE_BUNDLE=${PROFILE_APP_ID#"$TEAM_ID."}
-              if [[ "$PROFILE_BUNDLE" != "$BUNDLE_ID" &&
-                    "$PROFILE_BUNDLE" != "*" &&
-                    "$PROFILE_BUNDLE" != *".*" ]]; then
-                echo "::error::Provisioning profile Bundle ID mismatch"
-                exit 1
-              fi
-              ;;
-          esac
-
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILE_DIR"
-          cp "$WORK/profile.mobileprovision" "$PROFILE_DIR/$UUID.mobileprovision"
+          PROFILE_UUID="$(security cms -D -i "$RUNNER_TEMP/ios-build/profile.mobileprovision" | plutil -extract UUID raw -)"
+          cp "$RUNNER_TEMP/ios-build/profile.mobileprovision" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
+          echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
 
-          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
-          echo "team_id=$TEAM_ID" >> "$GITHUB_OUTPUT"
-          echo "profile_uuid=$UUID" >> "$GITHUB_OUTPUT"
-
-          unset CERT_PASSWORD KEYCHAIN_PASSWORD
-
-      - name: Install Flutter dependencies
-        working-directory: source
+      - name: Import distribution certificate
         run: |
           set -euo pipefail
-          flutter pub get
+          KEYCHAIN="$RUNNER_TEMP/ios-build/build.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -hex 16)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/ios-build/cert.p12" \
+            -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security \
+            -k "$KEYCHAIN"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
 
-      - name: Configure Xcode export
-        shell: bash
-        env:
-          BUNDLE_ID: ${{ steps.signing.outputs.bundle_id }}
-          TEAM_ID: ${{ steps.signing.outputs.team_id }}
-          PROFILE_UUID: ${{ steps.signing.outputs.profile_uuid }}
+      - name: Set up Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          cache: true
+
+      - name: Fetch dependencies
+        run: flutter pub get
+
+      - name: Build release IPA
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ios-build"
+          EXPORT_PLIST="$RUNNER_TEMP/ios-build/exportOptions.plist"
+          plutil -create xml1 "$EXPORT_PLIST"
+          plutil -replace method -string "app-store" "$EXPORT_PLIST"
+          plutil -replace teamID -string "$TEAM_ID" "$EXPORT_PLIST"
+          plutil -replace signingStyle -string "manual" "$EXPORT_PLIST"
+          plutil -replace uploadBitcode -bool false "$EXPORT_PLIST"
+          plutil -replace compileBitcode -bool false "$EXPORT_PLIST"
+          plutil -replace provisioningProfiles -json '{"'$BUNDLE_ID'" : "'$PROFILE_UUID'"}' "$EXPORT_PLIST"
 
-          /usr/libexec/PlistBuddy -c 'Add :method string app-store-connect' \
-            "$RUNNER_TEMP/ios-build/ExportOptions.plist" 2>/dev/null || true
-
-          cat > "$RUNNER_TEMP/ios-build/ExportOptions.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>app-store-connect</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>teamID</key>
-            <string>${TEAM_ID}</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>${BUNDLE_ID}</key>
-              <string>${PROFILE_UUID}</string>
-            </dict>
-          </dict>
-          </plist>
-          EOF
-
-      - name: Build IPA
-        working-directory: source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          flutter build ipa --release \
-            --export-options-plist="$RUNNER_TEMP/ios-build/ExportOptions.plist"
-
-          find build/ios/ipa -maxdepth 1 -name '*.ipa' -print -quit |
-            grep -q . || {
-              echo "::error::IPA was not generated"
-              exit 1
-            }
+          BUILD_ARGS=(build ipa --release --no-pub --export-options-plist="$EXPORT_PLIST")
+          if [ -n "$BUILD_FLAVOR" ]; then
+            BUILD_ARGS+=(--flavor "$BUILD_FLAVOR")
+          fi
+          flutter "${BUILD_ARGS[@]}"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: ios-ipa-${{ inputs.build_id }}
-          path: source/build/ios/ipa/*.ipa
+          path: build/ios/ipa/*.ipa
           if-no-files-found: error
           retention-days: 7
 
-      - name: Prepare App Store Connect API key
-        if: steps.bootstrap.outputs.build_mode == 'build_upload'
-        shell: bash
-        env:
-          CONFIG_PATH: ${{ runner.temp }}/ios-build/bootstrap.json
+      - name: Upload to TestFlight
+        if: env.TESTFLIGHT_ENABLED == 'true' && env.ASC_KEY_ID != ''
         run: |
           set -euo pipefail
-          umask 077
-
-          CONFIG="$CONFIG_PATH"
-          WORK="$RUNNER_TEMP/ios-build"
-
-          jq -e '
-            (.app_store_connect_key_base64 | strings | length > 0) and
-            (.app_store_connect_key_id | strings | length > 0) and
-            (.app_store_connect_issuer_id | strings | length > 0)
-          ' "$CONFIG" >/dev/null || {
-            echo "::error::App Store Connect credentials are missing"
-            exit 1
-          }
-
-          jq -er '.app_store_connect_key_base64' "$CONFIG" |
-            base64 --decode > "$WORK/AuthKey.p8"
-
-          # Fastlane API key JSON: keep the private key content in a
-          # temporary file, not in the repository or workflow logs.
-          jq -n \
-            --arg key_id "$(jq -er '.app_store_connect_key_id' "$CONFIG")" \
-            --arg issuer_id "$(jq -er '.app_store_connect_issuer_id' "$CONFIG")" \
-            --rawfile key "$WORK/AuthKey.p8" \
-            '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' \
-            > "$WORK/fastlane-api-key.json"
-
-          chmod 600 "$WORK/AuthKey.p8" "$WORK/fastlane-api-key.json"
-
-      - name: Setup Ruby
-        if: steps.bootstrap.outputs.build_mode == 'build_upload'
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.3"
-          bundler-cache: false
-
-      - name: Install Fastlane
-        if: steps.bootstrap.outputs.build_mode == 'build_upload'
-        run: gem install fastlane --no-document
-
-      - name: Upload to TestFlight with Fastlane
-        if: steps.bootstrap.outputs.build_mode == 'build_upload'
-        working-directory: source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          IPA=$(find build/ios/ipa -maxdepth 1 -name '*.ipa' -print -quit)
-          test -n "$IPA"
-
-          fastlane pilot upload \
-            --ipa "$IPA" \
-            --api_key_path "$RUNNER_TEMP/ios-build/fastlane-api-key.json" \
-            --skip_waiting_for_build_processing
+          IPATH="$(ls build/ios/ipa/*.ipa | head -n 1)"
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          cp "$ASC_KEY_PATH" "$HOME/.appstoreconnect/private_keys/$(basename "$ASC_KEY_PATH")"
+          xcrun altool --upload-app -f "$IPATH" -t ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
 
       - name: Cleanup signing credentials
         if: always()
-        shell: bash
         run: |
           set +e
-
-          security delete-keychain \
-            "$RUNNER_TEMP/ios-build/build-signing.keychain-db"
-
-          rm -f "$RUNNER_TEMP/ios-build/distribution.p12"
+          rm -f "$RUNNER_TEMP/ios-build/cert.p12"
           rm -f "$RUNNER_TEMP/ios-build/profile.mobileprovision"
-          rm -f "$RUNNER_TEMP/ios-build/profile.plist"
-          rm -f "$RUNNER_TEMP/ios-build/AuthKey.p8"
-          rm -f "$RUNNER_TEMP/ios-build/fastlane-api-key.json"
+          rm -f "$RUNNER_TEMP/ios-build/AuthKey_"*.p8
           rm -f "$RUNNER_TEMP/ios-build/bootstrap.json"
+          security delete-keychain "$RUNNER_TEMP/ios-build/build.keychain-db" 2>/dev/null
           rm -rf "$RUNNER_TEMP/ios-build"
