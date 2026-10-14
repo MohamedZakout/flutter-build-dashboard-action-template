@@ -46,9 +46,13 @@ jobs:
           mkdir -p "$WORK"
           BOOTSTRAP="$WORK/bootstrap.json"
 
+          BUILD_ID="${{ inputs.build_id }}"
+          ENDPOINT="${DASHBOARD_URL%/}/${BUILD_ID}/bootstrap"
+          echo "Bootstrap endpoint: $ENDPOINT"
+
           curl -fsS \
             -X POST \
-            "${DASHBOARD_URL%/}/api/internal/builds/${{ inputs.build_id }}/bootstrap" \
+            "$ENDPOINT" \
             -H "Authorization: Bearer ${{ secrets.BUILD_RUNNER_TOKEN }}" \
             -H "Content-Type: application/json" \
             --data "{\"runId\":\"${{ github.run_id }}\",\"repository\":\"${{ github.repository }}\",\"runAttempt\":${{ github.run_attempt }}}" \
