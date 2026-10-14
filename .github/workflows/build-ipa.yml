@@ -50,13 +50,19 @@ jobs:
           ENDPOINT="${DASHBOARD_URL%/}/${BUILD_ID}/bootstrap"
           echo "Bootstrap endpoint: $ENDPOINT"
 
-          curl -fsS \
+          HTTP_CODE="$(curl -sS \
+            -o "$BOOTSTRAP" \
+            -w '%{http_code}' \
             -X POST \
             "$ENDPOINT" \
             -H "Authorization: Bearer ${{ secrets.BUILD_RUNNER_TOKEN }}" \
             -H "Content-Type: application/json" \
-            --data "{\"runId\":\"${{ github.run_id }}\",\"repository\":\"${{ github.repository }}\",\"runAttempt\":${{ github.run_attempt }}}" \
-            -o "$BOOTSTRAP"
+            --data "{\"runId\":\"${{ github.run_id }}\",\"repository\":\"${{ github.repository }}\",\"runAttempt\":${{ github.run_attempt }}}")" || true
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Bootstrap failed with HTTP $HTTP_CODE"
+            cat "$BOOTSTRAP" || true
+            exit 1
+          fi
           chmod 600 "$BOOTSTRAP"
 
           SOURCE_REPO="$(jq -r '.source.repository' "$BOOTSTRAP")"
