@@ -117,9 +117,13 @@ jobs:
           set -euo pipefail
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILE_DIR"
-          PROFILE_UUID="$(security cms -D -i "$RUNNER_TEMP/ios-build/profile.mobileprovision" | plutil -extract UUID raw -)"
+          PROFILE_PLIST="$RUNNER_TEMP/ios-build/profile.plist"
+          security cms -D -i "$RUNNER_TEMP/ios-build/profile.mobileprovision" > "$PROFILE_PLIST"
+          PROFILE_UUID="$(plutil -extract UUID raw -o - "$PROFILE_PLIST")"
+          PROFILE_NAME="$(plutil -extract Name raw -o - "$PROFILE_PLIST")"
           cp "$RUNNER_TEMP/ios-build/profile.mobileprovision" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
           echo "PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
+          echo "PROFILE_NAME=$PROFILE_NAME" >> "$GITHUB_ENV"
 
       - name: Import distribution certificate
         run: |
@@ -139,6 +143,14 @@ jobs:
             -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN"
 
+          CERT_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F '"' '/^[[:space:]]*[0-9]+\)/ {print $2; exit}')"
+          if [ -z "$CERT_IDENTITY" ]; then
+            echo "::error::No code signing identity found in the imported certificate"
+            exit 1
+          fi
+          echo "CERT_IDENTITY=$CERT_IDENTITY" >> "$GITHUB_ENV"
+
       - name: Set up Flutter SDK
         uses: subosito/flutter-action@v2
         with:
@@ -146,6 +158,33 @@ jobs:
 
       - name: Fetch dependencies
         run: flutter pub get
+
+      - name: Configure manual code signing
+        run: |
+          set -euo pipefail
+          if ! ruby -e "require 'xcodeproj'" >/dev/null 2>&1; then
+            gem install xcodeproj --no-document || sudo gem install xcodeproj --no-document
+          fi
+          ruby <<'RUBY'
+          require "xcodeproj"
+
+          project = Xcodeproj::Project.open("ios/Runner.xcodeproj")
+          target = project.targets.find { |t| t.name == "Runner" }
+          raise "Runner target not found in ios/Runner.xcodeproj" unless target
+
+          target.build_configurations.each do |config|
+            settings = config.build_settings
+            settings["CODE_SIGN_STYLE"] = "Manual"
+            settings["DEVELOPMENT_TEAM"] = ENV.fetch("TEAM_ID")
+            settings["CODE_SIGN_IDENTITY"] = ENV.fetch("CERT_IDENTITY")
+            settings["CODE_SIGN_IDENTITY[sdk=iphoneos*]"] = ENV.fetch("CERT_IDENTITY")
+            settings["PROVISIONING_PROFILE_SPECIFIER"] = ENV.fetch("PROFILE_NAME")
+            settings["PRODUCT_BUNDLE_IDENTIFIER"] = ENV.fetch("BUNDLE_ID")
+          end
+
+          project.save
+          puts "Configured manual code signing for the Runner target"
+          RUBY
 
       - name: Build release IPA
         run: |
@@ -155,6 +194,7 @@ jobs:
           plutil -replace method -string "app-store" "$EXPORT_PLIST"
           plutil -replace teamID -string "$TEAM_ID" "$EXPORT_PLIST"
           plutil -replace signingStyle -string "manual" "$EXPORT_PLIST"
+          plutil -replace signingCertificate -string "$CERT_IDENTITY" "$EXPORT_PLIST"
           plutil -replace uploadBitcode -bool false "$EXPORT_PLIST"
           plutil -replace compileBitcode -bool false "$EXPORT_PLIST"
           plutil -replace provisioningProfiles -json '{"'$BUNDLE_ID'" : "'$PROFILE_UUID'"}' "$EXPORT_PLIST"
