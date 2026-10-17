@@ -1,16 +1,12 @@
 name: Build iOS IPA
 
-run-name: Build ${{ inputs.build_id }} [${{ inputs.correlation_id }}]
+run-name: Build ${{ inputs.build_id }}
 
 on:
   workflow_dispatch:
     inputs:
       build_id:
         description: Build identifier persisted by the dashboard
-        required: true
-        type: string
-      correlation_id:
-        description: Correlation id used to verify the run
         required: true
         type: string
 
